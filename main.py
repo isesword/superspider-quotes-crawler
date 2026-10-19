@@ -34,6 +34,7 @@ def now_str() -> str:
 
 
 def backend_post(path: str, payload: dict, timeout: int = 8) -> dict | None:
+    """POST 并解包 {code,message,data} 信封：code!=0 视为失败返回 None。"""
     try:
         req = urllib.request.Request(
             BACKEND + path,
@@ -42,10 +43,14 @@ def backend_post(path: str, payload: dict, timeout: int = 8) -> dict | None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            envelope = json.loads(resp.read().decode())
     except Exception as exc:
         print(f"[backend {path}] failed: {exc}")
         return None
+    if envelope.get("code") != 0:
+        print(f"[backend {path}] error: {str(envelope.get('message'))[:120]}")
+        return None
+    return envelope.get("data")
 
 
 def report_run(status: str, started: str, stats: dict, error_message: str = "") -> None:
