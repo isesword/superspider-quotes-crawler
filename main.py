@@ -80,7 +80,7 @@ def lease_account() -> dict | None:
     if result and result.get("accountId"):
         print(f"[account] leased #{result['accountId']} {result['accountName']} ({result['platform']})")
         return result
-    print("[account] lease failed/skipped")
+    print(f"[account] lease failed/skipped: {json.dumps(result, ensure_ascii=False)[:160] if result else 'no response'}")
     return None
 
 
@@ -94,7 +94,7 @@ def lease_proxy() -> dict | None:
     if result and result.get("proxyId"):
         print(f"[proxy] leased #{result['proxyId']} {result['protocol']}://{result['host']}:{result['port']}")
         return result
-    print("[proxy] lease failed/skipped -> direct")
+    print(f"[proxy] lease failed/skipped -> direct: {json.dumps(result, ensure_ascii=False)[:160] if result else 'no response'}")
     return None
 
 
