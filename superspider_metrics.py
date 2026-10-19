@@ -88,11 +88,19 @@ class Metrics:
         with self._lock:
             self._inc("superspider_store_fail_total", {}, count)
 
-    def proxy_request(self, ok: bool, ip_consumed: int = 0) -> None:
+    def proxy_request(self, ok: bool, ip_consumed: int = 0, via_proxy: bool = False) -> None:
         with self._lock:
-            self._inc("superspider_proxy_request_total", {"result": "success" if ok else "fail"})
+            self._inc("superspider_proxy_request_total", {
+                "result": "success" if ok else "fail",
+                **({"via_proxy": "true"} if via_proxy else {}),
+            })
             if ip_consumed > 0:
                 self._inc("superspider_proxy_ip_consumed_total", {}, ip_consumed)
+
+    def account_request(self, ok: bool, account: str) -> None:
+        """账号维度打点：使用某账号发起的请求/操作（含登录）。"""
+        with self._lock:
+            self._inc("superspider_account_request_total", {"account": account, "result": "success" if ok else "fail"})
 
     # ── 后台推送 ────────────────────────────────────────────────
     def start(self) -> None:

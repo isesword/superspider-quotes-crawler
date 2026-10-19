@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """SuperSpider 真实爬虫：抓取 quotes.toscrape.com（公开爬虫练习站）并按打点规范上报。
 
-- 分页遍历全部页面，解析名人名言（作者/正文/标签）
-- 业务打点：请求成功/失败、解析入库条数、IP 消耗（经代理时）
-- 收尾：POST /internal/runs/report 上报执行流水（含业务汇总）
-- 环境变量由平台下发（SUPERSPIDER_*），详见 docs/worker-metrics-spec.md
+资源编排（每次运行从平台内部接口租用，真实流转 DB 状态）：
+- 账号：/internal/accounts/lease 租身份 → 登录站点 → 收尾归还（失败会扣健康度）
+- 代理：/internal/proxies/lease 租节点 → 请求经代理发出 → 归还（失败下调成功率）
+
+多 pod 分片：平台以 Indexed Job 下发，JOB_COMPLETION_INDEX/REPLICAS 注入后
+按「页码 % 副本数 == 本 pod 序号」分页，互不重复；VM 按标签聚合出全量。
 """
 
 import datetime
@@ -12,6 +14,7 @@ import json
 import os
 import random
 import time
+import urllib.parse
 import urllib.request
 
 import requests
@@ -20,13 +23,29 @@ from bs4 import BeautifulSoup
 from superspider_metrics import M
 
 BACKEND = os.environ.get("SUPERSPIDER_BACKEND_URL", "http://host.docker.internal:8000")
-BASE = "http://quotes.toscrape.com"
-PAGE_DELAY = float(os.environ.get("CRAWL_PAGE_DELAY", "1.5"))  # 每页间隔，礼貌抓取
-MAX_PAGES = int(os.environ.get("CRAWL_MAX_PAGES", "0"))        # 0=全部页
+BASE = "https://quotes.toscrape.com"
+PAGE_DELAY = float(os.environ.get("CRAWL_PAGE_DELAY", "1.5"))
+USE_PROXY = os.environ.get("CRAWL_USE_PROXY", "1") == "1"
+NEED_ACCOUNT = os.environ.get("CRAWL_NEED_ACCOUNT", "1") == "1"
 
 
 def now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def backend_post(path: str, payload: dict, timeout: int = 8) -> dict | None:
+    try:
+        req = urllib.request.Request(
+            BACKEND + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as exc:
+        print(f"[backend {path}] failed: {exc}")
+        return None
 
 
 def report_run(status: str, started: str, stats: dict, error_message: str = "") -> None:
@@ -52,23 +71,92 @@ def report_run(status: str, started: str, stats: dict, error_message: str = "") 
         "errorValidation": stats["validation"],
         "ipConsumed": stats["ip"],
     }
+    result = backend_post("/api/v1/internal/runs/report", payload)
+    print("[run-report]", json.dumps(result, ensure_ascii=False)[:120] if result else "failed")
+
+
+def lease_account() -> dict | None:
+    result = backend_post("/api/v1/internal/accounts/lease", {"platform": ""})
+    if result and result.get("accountId"):
+        print(f"[account] leased #{result['accountId']} {result['accountName']} ({result['platform']})")
+        return result
+    print("[account] lease failed/skipped")
+    return None
+
+
+def release_account(account: dict, ok: bool) -> None:
+    if account:
+        backend_post("/api/v1/internal/accounts/release", {"accountId": account["accountId"], "ok": ok})
+
+
+def lease_proxy() -> dict | None:
+    result = backend_post("/api/v1/internal/proxies/lease", {})
+    if result and result.get("proxyId"):
+        print(f"[proxy] leased #{result['proxyId']} {result['protocol']}://{result['host']}:{result['port']}")
+        return result
+    print("[proxy] lease failed/skipped -> direct")
+    return None
+
+
+def release_proxy(proxy: dict, ok: bool) -> None:
+    if proxy:
+        backend_post("/api/v1/internal/proxies/release", {"proxyId": proxy["proxyId"], "ok": ok})
+
+
+def shard_info() -> tuple[int, int]:
+    index = int(os.environ.get("JOB_COMPLETION_INDEX", "0") or 0)
+    replicas = int(os.environ.get("SUPERSPIDER_REPLICAS", "1") or 1)
+    return index, max(1, replicas)
+
+
+def shard_of_page(page_num: int, replicas: int, index: int) -> bool:
+    return page_num % replicas == index
+
+
+def build_session(proxy: dict | None) -> requests.Session:
+    session = requests.Session()
+    session.headers["User-Agent"] = "SuperSpider-Crawler/0.2"
+    if proxy:
+        proxy_url = f"{proxy['protocol']}://{proxy['host']}:{proxy['port']}"
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        session.request = _timeout_wrap(session.request)  # type: ignore
+    return session
+
+
+def _timeout_wrap(fn):
+    def inner(method, url, **kwargs):
+        kwargs.setdefault("timeout", 8)
+        return fn(method, url, **kwargs)
+    return inner
+
+
+def login(session: requests.Session, account: dict, stats: dict) -> bool:
     try:
-        req = urllib.request.Request(
-            BACKEND + "/api/v1/internal/runs/report",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            print("[run-report]", resp.status, resp.read().decode()[:120])
+        resp = session.get(BASE + "/login", timeout=8)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        csrf = soup.select_one('input[name="csrf_token"]')
+        payload = {
+            "username": account["accountName"],
+            "password": os.environ.get("ACCOUNT_PASSWORD", "superspider"),
+        }
+        if csrf:
+            payload["csrf_token"] = csrf["value"]
+        resp = session.post(BASE + "/login", data=payload, timeout=8)
+        ok = "logout" in resp.text
+        stats["login_ok"] = ok
+        M.account_request(ok, account["accountName"])
+        print(f"[login] account={account['accountName']} ok={ok}")
+        return ok
     except Exception as exc:
-        print("[run-report] failed:", exc)
+        stats["login_ok"] = False
+        M.account_request(False, account.get("accountName", "unknown"))
+        print("[login] failed:", exc)
+        return False
 
 
-def fetch(url: str, stats: dict) -> str | None:
-    """请求页面：成功返回 HTML；失败按类型打点并返回 None"""
+def fetch(session: requests.Session, url: str, stats: dict) -> str | None:
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "SuperSpider-Demo/0.1"})
+        resp = session.get(url)
     except requests.exceptions.Timeout:
         stats["timeout"] += 1
         M.request(ok=False, error_type="timeout")
@@ -90,23 +178,27 @@ def fetch(url: str, stats: dict) -> str | None:
 
 
 def parse_quotes(html: str, stats: dict) -> int:
-    """解析名言并入库（入库 = M.crawl 计数）；校验失败计 store_fail"""
     soup = BeautifulSoup(html, "html.parser")
     stored = 0
     for item in soup.select("div.quote"):
         text = item.select_one("span.text")
         author = item.select_one("small.author")
+        tags = [a.get_text(strip=True) for a in item.select("div.tags a.tag")]
         if not text or not author:
             stats["validation"] += 1
             M.request(ok=False, error_type="validation")
             continue
-        # 入库（演示：打印摘要；真实场景写库/写队列）
         quote = text.get_text(strip=True)
-        print(f"[store] {author.get_text(strip=True)}: {quote[:60]}...")
+        print(f"[store] {author.get_text(strip=True)}: {quote[:60]}... tags={','.join(tags)}")
         stats["crawled"] += 1
         M.crawl(1)
         stored += 1
     return stored
+
+
+def next_page(html: str) -> str | None:
+    nxt = BeautifulSoup(html, "html.parser").select_one("li.next > a")
+    return urllib.parse.urljoin(BASE + "/", nxt["href"]) if nxt else None
 
 
 def main() -> None:
@@ -114,35 +206,54 @@ def main() -> None:
     start_ts = time.time()
     started = now_str()
     M.start()
-    print(f"[crawler] start labels={M._labels} base={BASE}")
 
-    stats = {"crawled": 0, "store_fail": 0, "timeout": 0, "blocked": 0, "server": 0, "validation": 0, "ip": 0}
-    url, pages = BASE + "/", 0
+    index, replicas = shard_info()
+    proxy = lease_proxy() if USE_PROXY else None
+    session, proxy_info = build_session(proxy)
+    print(f"[crawler] start shard={index}/{replicas} proxy={proxy_info} base={BASE}")
 
-    while url and (MAX_PAGES <= 0 or pages < MAX_PAGES):
-        html = fetch(url, stats)
-        if html is None:
-            time.sleep(3)
+    account = lease_account() if NEED_ACCOUNT else None
+    stats = {"crawled": 0, "store_fail": 0, "timeout": 0, "blocked": 0, "server": 0,
+             "validation": 0, "ip": 0, "login_ok": False}
+    if account:
+        login(session, account, stats)
+
+    url, page_num, crawled_pages = BASE + "/", 1, 0
+    while url:
+        if not shard_of_page(page_num, replicas, index):
+            print(f"[shard] skip page {page_num}")
+            page_num += 1
+            url = f"{BASE}/page/{page_num}/" if page_num <= 10 else None
             continue
-        stored = parse_quotes(html, stats)
-        stats["crawled"] += 0  # crawl 计数在 parse 内逐条 M.crawl
-        pages += 1
-
-        # 下一页
-        nxt = BeautifulSoup(html, "html.parser").select_one("li.next > a")
-        url = BASE + nxt["href"] if nxt else None
-
-        # 模拟 IP 消耗（经代理出口时）
+        html = fetch(session, url, stats)
+        if html is None and proxy:
+            # 代理失败：回退直连重试一次（真实爬虫行为），代理侧已计失败
+            release_proxy(proxy, False)
+            session.proxies = {}
+            proxy_info = None
+            html = fetch(session, url, stats)
+        if html is None:
+            page_num += 1
+            url = f"{BASE}/page/{page_num}/" if page_num <= 10 else None
+            continue
+        parse_quotes(html, stats)
+        crawled_pages += 1
+        page_num += 1
+        url = next_page(html)
         if random.random() < 0.3:
             stats["ip"] += 1
-            M.proxy_request(ok=True, ip_consumed=1)
-
+            M.proxy_request(ok=True, ip_consumed=1, via_proxy=bool(proxy_info))
         time.sleep(PAGE_DELAY)
+
+    account_ok = bool(stats.get("login_ok", True))
+    release_account(account, account_ok)
+    if proxy:
+        release_proxy(proxy, stats["blocked"] + stats["timeout"] == 0)
 
     status = "success" if stats["timeout"] + stats["blocked"] + stats["server"] < 5 else "failed"
     err = "" if status == "success" else f"网络失败过多（timeout={stats['timeout']}, blocked={stats['blocked']}, 5xx={stats['server']}）"
     report_run(status, started, stats, err)
-    print(f"[crawler] done pages={pages} stats={stats} status={status}")
+    print(f"[crawler] done shard={index}/{replicas} pages={crawled_pages} stats={stats} status={status}")
 
 
 if __name__ == "__main__":
