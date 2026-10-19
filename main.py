@@ -139,6 +139,16 @@ def _timeout_wrap(fn):
 def login(session: requests.Session, account: dict, stats: dict) -> bool:
     try:
         resp = session.get(BASE + "/login", timeout=8)
+    except requests.exceptions.ProxyError:
+        # 代理不可达导致登录失败：去代理直连重试一次
+        session.proxies = {}
+        try:
+            resp = session.get(BASE + "/login", timeout=8)
+        except Exception as exc:
+            M.account_request(False, account["accountName"])
+            print("[login] failed (direct):", exc)
+            return False
+    try:
         soup = BeautifulSoup(resp.text, "html.parser")
         csrf = soup.select_one('input[name="csrf_token"]')
         payload = {
@@ -163,6 +173,12 @@ def login(session: requests.Session, account: dict, stats: dict) -> bool:
 def fetch(session: requests.Session, url: str, stats: dict) -> str | None:
     try:
         resp = session.get(url)
+    except requests.exceptions.ProxyError as exc:
+        # 代理不可达：计入代理域失败（走 M.proxy_request fail），不误报目标站 5xx
+        stats["proxy_fail"] = stats.get("proxy_fail", 0) + 1
+        M.proxy_request(ok=False, via_proxy=True)
+        print(f"[proxy] unreachable: {str(exc)[:80]}")
+        return None
     except requests.exceptions.Timeout:
         stats["timeout"] += 1
         M.request(ok=False, error_type="timeout")
