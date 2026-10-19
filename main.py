@@ -113,14 +113,15 @@ def shard_of_page(page_num: int, replicas: int, index: int) -> bool:
     return page_num % replicas == index
 
 
-def build_session(proxy: dict | None) -> requests.Session:
+def build_session(proxy: dict | None) -> tuple[requests.Session, dict | None]:
     session = requests.Session()
     session.headers["User-Agent"] = "SuperSpider-Crawler/0.2"
-    if proxy:
-        proxy_url = f"{proxy['protocol']}://{proxy['host']}:{proxy['port']}"
-        session.proxies = {"http": proxy_url, "https": proxy_url}
-        session.request = _timeout_wrap(session.request)  # type: ignore
-    return session
+    if not proxy:
+        return session, None
+    proxy_url = f"{proxy['protocol']}://{proxy['host']}:{proxy['port']}"
+    session.proxies = {"http": proxy_url, "https": proxy_url}
+    session.request = _timeout_wrap(session.request)  # type: ignore
+    return session, {"url": proxy_url}
 
 
 def _timeout_wrap(fn):
