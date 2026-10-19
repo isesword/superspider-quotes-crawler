@@ -1,0 +1,9 @@
+[project]
+name = "superspider-quotes-crawler"
+version = "0.1.0"
+description = "SuperSpider 演示爬虫：抓取 quotes.toscrape.com（合法爬虫练习站）"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+]
