@@ -1,0 +1,214 @@
+# -*- coding: utf-8 -*-
+"""BaseCrawler 抽象基类：子类只需实现 targets/parse/store，其余全自动。
+
+自动处理：
+- 分片（多 pod 按页码/URL 序号 % 副本数 分配）
+- 代理路由（租代理→走代理请求→失败回退直连→归还是否成功）
+- 账号租用与归还（可选）
+- 打点（request/crawl/store_fail/proxy/account 全指标）
+- 批量入库（CH crawl_data 表）
+- run 上报（含业务汇总）
+"""
+
+import datetime
+import os
+import time
+import urllib.parse
+
+import requests
+
+from .metrics import M
+from .session import lease_account, release_account, lease_proxy, release_proxy
+from .storage import batch_insert, report_run
+
+
+class BaseCrawler:
+    """爬虫基类。子类实现 targets() / parse() / store() 三个方法。"""
+
+    def __init__(self):
+        self.start_ts = time.time()
+        self.started_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.stats = {
+            "crawled": 0, "store_fail": 0, "timeout": 0, "blocked": 0,
+            "server": 0, "validation": 0, "ip": 0, "pages": 0,
+        }
+        self.page_delay = float(os.environ.get("CRAWL_PAGE_DELAY", "1.5"))
+        self.use_proxy = os.environ.get("CRAWL_USE_PROXY", "1") == "1"
+        self.use_account = os.environ.get("CRAWL_NEED_ACCOUNT", "0") == "1"
+
+        # 分片
+        self.shard_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0") or 0)
+        self.shard_replicas = max(1, int(os.environ.get("SUPERSPIDER_REPLICAS", "1") or 1))
+
+        # 资源
+        self.proxy = lease_proxy() if self.use_proxy else None
+        self.account = lease_account() if self.use_account else None
+        self.session = self._build_session()
+
+    # ── 子类必须实现 ────────────────────────────────────────────────
+
+    def targets(self) -> list[str]:
+        """返回要抓取的 URL 列表（已按分片过滤或全量由基类分片）。"""
+        raise NotImplementedError
+
+    def parse(self, html: str, url: str) -> list[dict]:
+        """解析页面 → 业务数据字典列表。打点由基类负责。"""
+        raise NotImplementedError
+
+    def store(self, items: list[dict]) -> int:
+        """入库。返回实际入库条数（打 store_fail 由基类算）。"""
+        raise NotImplementedError
+
+    # ── 可选覆写 ────────────────────────────────────────────────────
+
+    def on_start(self):
+        """运行前钩子（如登录）。"""
+
+    def on_finish(self, status: str):
+        """运行后钩子。"""
+
+    # ── 基类内部 ────────────────────────────────────────────────────
+
+    def _build_session(self):
+        session = requests.Session()
+        session.headers["User-Agent"] = "SuperSpider-Crawler/0.2"
+        if self.proxy:
+            proxy_url = f"{self.proxy['protocol']}://{self.proxy['host']}:{self.proxy['port']}"
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+        return session
+
+    def _shard_targets(self, urls: list[str]) -> list[str]:
+        """按 URL 序号 % 副本数 分片。"""
+        if self.shard_replicas <= 1:
+            return urls
+        return [u for i, u in enumerate(urls) if i % self.shard_replicas == self.shard_index]
+
+    def _fetch(self, url: str) -> str | None:
+        try:
+            resp = self.session.get(url, timeout=15)
+        except requests.exceptions.Timeout:
+            self.stats["timeout"] += 1
+            M.request(ok=False, error_type="timeout")
+            return None
+        except requests.exceptions.ProxyError:
+            self.stats["blocked"] += 1
+            M.proxy_request(ok=False, via_proxy=True)
+            return None
+        except requests.exceptions.RequestException:
+            self.stats["server"] += 1
+            M.request(ok=False, error_type="server_5xx")
+            return None
+        if resp.status_code == 429:
+            self.stats["blocked"] += 1
+            M.request(ok=False, error_type="blocked_429")
+            return None
+        if resp.status_code >= 500:
+            self.stats["server"] += 1
+            M.request(ok=False, error_type="server_5xx")
+            return None
+        M.request(ok=True, duration=resp.elapsed.total_seconds())
+        return resp.text
+
+    def _report_run(self, status: str, error_message: str = ""):
+        task_id = os.environ.get("SUPERSPIDER_TASK_ID", "")
+        if not task_id.isdigit():
+            print("[run-report] skip: no SUPERSPIDER_TASK_ID")
+            return
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload = {
+            "taskId": int(task_id),
+            "projectId": int(os.environ.get("SUPERSPIDER_PROJECT_ID", "0") or 0),
+            "status": status,
+            "triggerType": os.environ.get("SUPERSPIDER_TRIGGER_TYPE", "manual"),
+            "startedAt": self.started_at,
+            "finishedAt": now,
+            "durationMs": int((time.time() - self.start_ts) * 1000),
+            "retryCount": 0,
+            "errorMessage": error_message,
+            "crawledCount": self.stats["crawled"],
+            "storeFailCount": self.stats["store_fail"],
+            "errorTimeout": self.stats["timeout"],
+            "errorBlocked": self.stats["blocked"],
+            "errorServer": self.stats["server"],
+            "errorValidation": self.stats["validation"],
+            "ipConsumed": self.stats["ip"],
+        }
+        result = report_run(payload)
+        print(f"[run-report] {result}")
+
+    def _store_batch(self, items: list[dict]):
+        """批量写入 CH crawl_data 表（附带 run 元数据）。"""
+        if not items:
+            return
+        task_id = os.environ.get("SUPERSPIDER_TASK_ID", "0")
+        project = os.environ.get("SUPERSPIDER_PROJECT", "")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for item in items:
+            row = {"task_id": int(task_id or 0), "project": project, "crawled_at": now}
+            row.update(item)
+            rows.append(row)
+        batch_insert("crawl_data", rows)
+
+    # ── 主入口 ──────────────────────────────────────────────────────
+
+    def run(self):
+        M.start()
+        print(f"[crawler] start shard={self.shard_index}/{self.shard_replicas} "
+              f"proxy={'yes' if self.proxy else 'direct'} account={'yes' if self.account else 'no'}")
+
+        self.on_start()
+
+        all_targets = self.targets()
+        targets = self._shard_targets(all_targets)
+        print(f"[crawler] targets: {len(targets)}/{len(all_targets)} (shard {self.shard_index})")
+
+        pending_store: list[dict] = []
+        for url in targets:
+            html = self._fetch(url)
+            if html is None:
+                time.sleep(2)
+                continue
+            try:
+                items = self.parse(html, url)
+            except Exception as exc:
+                print(f"[parse error] {url}: {exc}")
+                self.stats["validation"] += 1
+                M.request(ok=False, error_type="validation")
+                continue
+
+            # 基类计数（子类 parse 也可直接 M.crawl）
+            if items:
+                self.stats["crawled"] += len(items)
+                M.crawl(len(items))
+                pending_store.extend(items)
+
+            # 批量入库（每 50 条或最后）
+            if len(pending_store) >= 50:
+                stored = self.store(pending_store)
+                if stored < len(pending_store):
+                    fail = len(pending_store) - stored
+                    self.stats["store_fail"] += fail
+                    M.store_fail(fail)
+                pending_store = []
+
+            self.stats["pages"] += 1
+            time.sleep(self.page_delay)
+
+        # 收尾入库
+        if pending_store:
+            stored = self.store(pending_store)
+            if stored < len(pending_store):
+                self.stats["store_fail"] += len(pending_store) - stored
+                M.store_fail(len(pending_store) - stored)
+
+        # 收尾
+        ok = self.stats["timeout"] + self.stats["blocked"] + self.stats["server"] < 5
+        status = "success" if ok else "failed"
+        err = "" if ok else f"网络失败过多（timeout={self.stats['timeout']}, blocked={self.stats['blocked']}, 5xx={self.stats['server']}）"
+
+        release_account(self.account, account_ok := stats.get("login_ok", True))
+        release_proxy(self.proxy, self.stats["blocked"] + self.stats["timeout"] == 0)
+        self._report_run(status, err)
+        self.on_finish(status)
+        print(f"[crawler] done pages={self.stats['pages']} stats={self.stats} status={status}")
