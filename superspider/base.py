@@ -44,6 +44,9 @@ class BaseCrawler:
         self.proxy = lease_proxy() if self.use_proxy else None
         self.account = lease_account() if self.use_account else None
         self.session = self._build_session()
+        if self.proxy:
+            self.stats["ip"] += 1
+            M.proxy_request(ok=True, ip_consumed=1)
 
     # ── 子类必须实现 ────────────────────────────────────────────────
 
