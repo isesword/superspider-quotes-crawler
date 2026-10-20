@@ -5,6 +5,8 @@ import os
 import urllib.request
 import json
 
+from .log import logger
+
 _BACKEND = os.environ.get("SUPERSPIDER_BACKEND_URL", "http://host.docker.internal:8000")
 
 
