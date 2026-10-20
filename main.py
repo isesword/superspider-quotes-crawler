@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
-"""入口：根据 CRAWLER_NAME 环境变量选择具体爬虫类。"""
-import os, sys
+"""入口：根据 CRAWLER_NAME 环境变量选择具体爬虫类。
+
+- 单次模式（默认）：跑一轮退出，cron/手动运行用。
+- 长驻模式：CRAWL_LOOP=1 时每轮之间睡 CRAWL_LOOP_INTERVAL 秒（默认 30）。
+  long 任务用 cmdOverride 启动：CRAWL_LOOP=1 python main.py。
+  优雅停止由 BaseCrawler 的信号处理器负责（冲账/释放租约/上报 stopped 后退出），
+  两轮之间则由这里的轻量 handler 直接退出（没有在途 run 需要收尾）。
+"""
+import os
+import signal
+import sys
+import time
+
 sys.path.insert(0, os.path.dirname(__file__))
 from crawlers.quotes import QuotesCrawler
 
 CRAWLERS = {"quotes": QuotesCrawler}
+
 
 def main():
     name = os.environ.get("CRAWLER_NAME", "quotes")
@@ -12,7 +24,24 @@ def main():
     if not cls:
         print(f"[main] unknown crawler {name!r}, available: {list(CRAWLERS)}")
         sys.exit(1)
-    cls().run()
+
+    if os.environ.get("CRAWL_LOOP", "0") != "1":
+        cls().run()
+        return
+
+    interval = float(os.environ.get("CRAWL_LOOP_INTERVAL", "30"))
+    between_passes = lambda *_: sys.exit(0)  # noqa: E731
+    n = 0
+    while True:
+        n += 1
+        print(f"[main] ===== 长驻第 {n} 轮 =====")
+        cls().run()
+        # 两轮之间：信号直接退出（无在途 run）；run 内已重装 handler，这里换回轻量的
+        signal.signal(signal.SIGTERM, between_passes)
+        signal.signal(signal.SIGINT, between_passes)
+        print(f"[main] 睡 {interval}s 后进入下一轮")
+        time.sleep(interval)
+
 
 if __name__ == "__main__":
     main()

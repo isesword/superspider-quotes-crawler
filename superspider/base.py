@@ -12,6 +12,8 @@
 
 import datetime
 import os
+import signal
+import sys
 import time
 import urllib.parse
 
@@ -40,6 +42,10 @@ class BaseCrawler:
         self.shard_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0") or 0)
         self.shard_replicas = max(1, int(os.environ.get("SUPERSPIDER_REPLICAS", "1") or 1))
 
+        # 优雅停止：待入库缓冲 + 停止标记（run 循环与信号处理器共用）
+        self.pending: list[dict] = []
+        self._stopping = False
+
         # 资源
         self.proxy = lease_proxy() if self.use_proxy else None
         self.account = lease_account() if self.use_account else None
@@ -47,6 +53,11 @@ class BaseCrawler:
         if self.proxy:
             self.stats["ip"] += 1
             M.proxy_request(ok=True, ip_consumed=1)
+
+        # SIGTERM/SIGINT → 秒级优雅停止（冲账、释放租约、上报 stopped）。
+        # 注册了 handler 的进程不受内核 PID1 默认信号免疫影响，长驻模式必须。
+        signal.signal(signal.SIGTERM, self._on_stop_signal)
+        signal.signal(signal.SIGINT, self._on_stop_signal)
 
     # ── 子类必须实现 ────────────────────────────────────────────────
 
@@ -183,14 +194,15 @@ class BaseCrawler:
         targets = self._shard_targets(all_targets)
         print(f"[crawler] targets: {len(targets)}/{len(all_targets)} (shard {self.shard_index})")
 
-        pending_store: list[dict] = []
         deferred: list[str] = []  # 经代理 200 但解析为空的页，待切直连后重抓
         for url in targets:
+            if self._stopping:  # 双保险：信号处理器异常时循环也能退出
+                break
             items = self._process(url)
             if items is None:
                 time.sleep(2)
                 continue
-            pending_store.extend(items)
+            self.pending.extend(items)
 
             if not items and self.proxy:
                 # 200 但解析为空：免费代理常见劣化（劫持/插页返回垃圾 200 页）
@@ -206,36 +218,59 @@ class BaseCrawler:
                     for u in deferred:
                         got = self._process(u)
                         if got:
-                            pending_store.extend(got)
+                            self.pending.extend(got)
                     deferred = []
                 continue
 
             # 批量入库（每 50 条或最后）
-            if len(pending_store) >= 50:
-                stored = self.store(pending_store)
-                if stored < len(pending_store):
-                    fail = len(pending_store) - stored
+            if len(self.pending) >= 50:
+                stored = self.store(self.pending)
+                if stored < len(self.pending):
+                    fail = len(self.pending) - stored
                     self.stats["store_fail"] += fail
                     M.store_fail(fail)
-                pending_store = []
+                self.pending = []
 
             self.stats["pages"] += 1
             time.sleep(self.page_delay)
-
-        # 收尾入库
-        if pending_store:
-            stored = self.store(pending_store)
-            if stored < len(pending_store):
-                self.stats["store_fail"] += len(pending_store) - stored
-                M.store_fail(len(pending_store) - stored)
 
         # 收尾
         ok = self.stats["timeout"] + self.stats["blocked"] + self.stats["server"] < 5
         status = "success" if ok else "failed"
         err = "" if ok else f"网络失败过多（timeout={self.stats['timeout']}, blocked={self.stats['blocked']}, 5xx={self.stats['server']}）"
+        self._finish(status, err)
+        print(f"[crawler] done pages={self.stats['pages']} stats={self.stats} status={status}")
 
-        release_account(self.account, account_ok := self.stats.get("login_ok", True))
+    # ── 优雅停止 ────────────────────────────────────────────────────
+
+    def _finish(self, status: str, err: str = ""):
+        """收尾共用：冲账 → 归还租约 → 上报 run → on_finish。正常完成与信号停止共用。"""
+        if self.pending:
+            stored = self.store(self.pending)
+            if stored < len(self.pending):
+                fail = len(self.pending) - stored
+                self.stats["store_fail"] += fail
+                M.store_fail(fail)
+            self.pending = []
+        release_account(self.account, self.stats.get("login_ok", True))
         release_proxy(self.proxy, self.stats["blocked"] + self.stats["timeout"] == 0)
         self._report_run(status, err)
         self.on_finish(status)
-        print(f"[crawler] done pages={self.stats['pages']} stats={self.stats} status={status}")
+
+    def _on_stop_signal(self, signum, _frame):
+        """SIGTERM/SIGINT：冲账、释放租约、上报 stopped 后秒级退出。
+
+        二次信号（清理进行中再收到）直接 os._exit，避免重入 HTTP 调用；
+        30s K8s 宽限期是最后兜底。sys.exit 触发 atexit → VM 指标最终推送。
+        """
+        if self._stopping:
+            os._exit(0)
+        self._stopping = True
+        name = signal.Signals(signum).name
+        print(f"[crawler] 收到 {name}，优雅停止（冲账/释放租约/上报）")
+        try:
+            self._finish("stopped", f"收到 {name} 优雅停止")
+            print(f"[crawler] stopped pages={self.stats['pages']} stats={self.stats}")
+        except Exception as exc:
+            print(f"[crawler] 优雅停止清理异常（继续退出）: {exc}")
+        sys.exit(0)
