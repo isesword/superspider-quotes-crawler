@@ -207,7 +207,7 @@ class BaseCrawler:
         status = "success" if ok else "failed"
         err = "" if ok else f"网络失败过多（timeout={self.stats['timeout']}, blocked={self.stats['blocked']}, 5xx={self.stats['server']}）"
 
-        release_account(self.account, account_ok := stats.get("login_ok", True))
+        release_account(self.account, account_ok := self.stats.get("login_ok", True))
         release_proxy(self.proxy, self.stats["blocked"] + self.stats["timeout"] == 0)
         self._report_run(status, err)
         self.on_finish(status)
