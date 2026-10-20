@@ -14,6 +14,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from crawlers.quotes import QuotesCrawler
+from superspider.log import logger, setup
+
+setup()
 
 CRAWLERS = {"quotes": QuotesCrawler}
 
@@ -22,7 +25,7 @@ def main():
     name = os.environ.get("CRAWLER_NAME", "quotes")
     cls = CRAWLERS.get(name)
     if not cls:
-        print(f"[main] unknown crawler {name!r}, available: {list(CRAWLERS)}")
+        logger.error("unknown crawler {} available={}", name, list(CRAWLERS))
         sys.exit(1)
 
     if os.environ.get("CRAWL_LOOP", "0") != "1":
@@ -34,12 +37,12 @@ def main():
     n = 0
     while True:
         n += 1
-        print(f"[main] ===== 长驻第 {n} 轮 =====")
+        logger.info("loop pass #{}", n)
         cls().run()
         # 两轮之间：信号直接退出（无在途 run）；run 内已重装 handler，这里换回轻量的
         signal.signal(signal.SIGTERM, between_passes)
         signal.signal(signal.SIGINT, between_passes)
-        print(f"[main] 睡 {interval}s 后进入下一轮")
+        logger.info("sleep {}s before next pass", interval)
         time.sleep(interval)
 
 

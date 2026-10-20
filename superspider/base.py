@@ -19,6 +19,7 @@ import urllib.parse
 
 import requests
 
+from .log import logger
 from .metrics import M
 from .session import lease_account, release_account, lease_proxy, release_proxy
 from .storage import batch_insert, report_run
@@ -126,7 +127,7 @@ class BaseCrawler:
     def _report_run(self, status: str, error_message: str = ""):
         task_id = os.environ.get("SUPERSPIDER_TASK_ID", "")
         if not task_id.isdigit():
-            print("[run-report] skip: no SUPERSPIDER_TASK_ID")
+            logger.warning("run report skip: no SUPERSPIDER_TASK_ID")
             return
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         payload = {
@@ -148,7 +149,7 @@ class BaseCrawler:
             "ipConsumed": self.stats["ip"],
         }
         result = report_run(payload)
-        print(f"[run-report] {result}")
+        logger.info("run reported | result={}", result)
 
     def _store_batch(self, items: list[dict]):
         """批量写入 CH crawl_data 表（附带 run 元数据）。"""
@@ -174,7 +175,7 @@ class BaseCrawler:
         try:
             items = self.parse(html, url)
         except Exception as exc:
-            print(f"[parse error] {url}: {exc}")
+            logger.error("parse error | url={} err={}", url, exc)
             self.stats["validation"] += 1
             M.request(ok=False, error_type="validation")
             return []
@@ -185,14 +186,15 @@ class BaseCrawler:
 
     def run(self):
         M.start()
-        print(f"[crawler] start shard={self.shard_index}/{self.shard_replicas} "
-              f"proxy={'yes' if self.proxy else 'direct'} account={'yes' if self.account else 'no'}")
+        logger.info("crawl start | shard={}/{} proxy={} account={}",
+                    self.shard_index, self.shard_replicas,
+                    "yes" if self.proxy else "direct", "yes" if self.account else "no")
 
         self.on_start()
 
         all_targets = self.targets()
         targets = self._shard_targets(all_targets)
-        print(f"[crawler] targets: {len(targets)}/{len(all_targets)} (shard {self.shard_index})")
+        logger.info("targets assigned | all={} mine={} shard={}", len(all_targets), len(targets), self.shard_index)
 
         deferred: list[str] = []  # 经代理 200 但解析为空的页，待切直连后重抓
         for url in targets:
@@ -207,10 +209,10 @@ class BaseCrawler:
             if not items and self.proxy:
                 # 200 但解析为空：免费代理常见劣化（劫持/插页返回垃圾 200 页）
                 self.stats["empty_pages"] += 1
-                print(f"[proxy] empty parse via proxy ({self.stats['empty_pages']}): {url}")
+                logger.warning("empty parse via proxy | count={} url={}", self.stats["empty_pages"], url)
                 deferred.append(url)
                 if self.stats["empty_pages"] >= 2:
-                    print("[proxy] proxy degraded → release and switch to direct")
+                    logger.warning("proxy degraded, release and switch to direct")
                     M.proxy_request(ok=False, via_proxy=True)
                     release_proxy(self.proxy, False)
                     self.proxy = None
@@ -239,7 +241,7 @@ class BaseCrawler:
         status = "success" if ok else "failed"
         err = "" if ok else f"网络失败过多（timeout={self.stats['timeout']}, blocked={self.stats['blocked']}, 5xx={self.stats['server']}）"
         self._finish(status, err)
-        print(f"[crawler] done pages={self.stats['pages']} stats={self.stats} status={status}")
+        logger.bind(**self.stats).info("crawl done | status={}", status)
 
     # ── 优雅停止 ────────────────────────────────────────────────────
 
@@ -267,10 +269,10 @@ class BaseCrawler:
             os._exit(0)
         self._stopping = True
         name = signal.Signals(signum).name
-        print(f"[crawler] 收到 {name}，优雅停止（冲账/释放租约/上报）")
+        logger.warning("graceful stop: signal received | signal={}", name)
         try:
             self._finish("stopped", f"收到 {name} 优雅停止")
-            print(f"[crawler] stopped pages={self.stats['pages']} stats={self.stats}")
+            logger.bind(**self.stats).warning("graceful stop finished | status=stopped")
         except Exception as exc:
-            print(f"[crawler] 优雅停止清理异常（继续退出）: {exc}")
+            logger.error("graceful stop cleanup error (exit anyway) | err={}", exc)
         sys.exit(0)

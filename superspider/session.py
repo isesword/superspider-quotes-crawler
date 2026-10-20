@@ -20,10 +20,10 @@ def _post(path: str, payload: dict, timeout: int = 8) -> dict | None:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             envelope = json.loads(resp.read().decode())
     except Exception as exc:
-        print(f"[backend {path}] failed: {exc}")
+        logger.error("backend call failed | path={} err={}", path, exc)
         return None
     if envelope.get("code") != 0:
-        print(f"[backend {path}] error: {str(envelope.get('message'))[:120]}")
+        logger.error("backend call error | path={} msg={}", path, str(envelope.get("message"))[:120])
         return None
     return envelope.get("data")
 
@@ -31,9 +31,9 @@ def _post(path: str, payload: dict, timeout: int = 8) -> dict | None:
 def lease_account(platform: str = "") -> dict | None:
     result = _post("/api/v1/internal/accounts/lease", {"platform": platform})
     if result and result.get("accountId"):
-        print(f"[account] leased #{result['accountId']} {result['accountName']} ({result['platform']})")
+        logger.info("account leased | id={} name={} platform={}", result["accountId"], result["accountName"], result["platform"])
         return result
-    print(f"[account] lease failed/skipped: {result}")
+    logger.warning("account lease failed/skipped | result={}", result)
     return None
 
 
@@ -45,9 +45,9 @@ def release_account(account: dict, ok: bool) -> None:
 def lease_proxy() -> dict | None:
     result = _post("/api/v1/internal/proxies/lease", {})
     if result and result.get("proxyId"):
-        print(f"[proxy] leased #{result['proxyId']} {result['protocol']}://{result['host']}:{result['port']}")
+        logger.info("proxy leased | id={} addr={}://{}:{}", result["proxyId"], result["protocol"], result["host"], result["port"])
         return result
-    print(f"[proxy] lease failed/skipped -> direct")
+    logger.warning("proxy lease failed/skipped, fallback direct")
     return None
 
 

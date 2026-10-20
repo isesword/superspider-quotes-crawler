@@ -5,6 +5,8 @@ import json
 import os
 import urllib.request
 
+from .log import logger
+
 _CH_URL = os.environ.get("SUPERSPIDER_CH_URL", "http://host.docker.internal:8123")
 _CH_USER = os.environ.get("SUPERSPIDER_CH_USER", "default")
 _CH_PASSWORD = os.environ.get("SUPERSPIDER_CH_PASSWORD", "123456")
@@ -27,7 +29,7 @@ def batch_insert(table: str, rows: list[dict]) -> bool:
                 if resp.status < 300:
                     return True
         except Exception as exc:
-            print(f"[ch-insert {table}] failed: {exc}")
+            logger.error("ch insert failed | table={} err={}", table, exc)
     return False
 
 
@@ -42,5 +44,5 @@ def report_run(payload: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode())
     except Exception as exc:
-        print(f"[run-report] failed: {exc}")
+        logger.error("run report failed | err={}", exc)
         return None
