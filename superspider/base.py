@@ -151,10 +151,10 @@ class BaseCrawler:
         result = report_run(payload)
         logger.info("run reported | result={}", result)
 
-    def _store_batch(self, items: list[dict]):
-        """批量写入 CH crawl_data 表（附带 run 元数据）。"""
+    def _store_batch(self, items: list[dict]) -> bool:
+        """批量写入 CH crawl_data 表（附带 run 元数据）。返回是否全部成功。"""
         if not items:
-            return
+            return True
         task_id = os.environ.get("SUPERSPIDER_TASK_ID", "0")
         project = os.environ.get("SUPERSPIDER_PROJECT", "")
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")

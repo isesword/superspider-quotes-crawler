@@ -36,4 +36,4 @@ class QuotesCrawler(BaseCrawler):
         return items
 
     def store(self, items: list[dict]) -> int:
-        return len(items) if batch_insert("crawl_data", items) else 0
+        return len(items) if self._store_batch(items) else 0
