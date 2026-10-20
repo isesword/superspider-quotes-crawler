@@ -30,7 +30,7 @@ class BaseCrawler:
         self.started_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.stats = {
             "crawled": 0, "store_fail": 0, "timeout": 0, "blocked": 0,
-            "server": 0, "validation": 0, "ip": 0, "pages": 0,
+            "server": 0, "validation": 0, "ip": 0, "pages": 0, "empty_pages": 0,
         }
         self.page_delay = float(os.environ.get("CRAWL_PAGE_DELAY", "1.5"))
         self.use_proxy = os.environ.get("CRAWL_USE_PROXY", "1") == "1"
@@ -152,6 +152,23 @@ class BaseCrawler:
 
     # ── 主入口 ──────────────────────────────────────────────────────
 
+    def _process(self, url: str) -> list[dict] | None:
+        """抓取+解析+计数。返回 None=页面失败；空列表=空页。"""
+        html = self._fetch(url)
+        if html is None:
+            return None
+        try:
+            items = self.parse(html, url)
+        except Exception as exc:
+            print(f"[parse error] {url}: {exc}")
+            self.stats["validation"] += 1
+            M.request(ok=False, error_type="validation")
+            return []
+        if items:
+            self.stats["crawled"] += len(items)
+            M.crawl(len(items))
+        return items
+
     def run(self):
         M.start()
         print(f"[crawler] start shard={self.shard_index}/{self.shard_replicas} "
@@ -164,24 +181,31 @@ class BaseCrawler:
         print(f"[crawler] targets: {len(targets)}/{len(all_targets)} (shard {self.shard_index})")
 
         pending_store: list[dict] = []
+        deferred: list[str] = []  # 经代理 200 但解析为空的页，待切直连后重抓
         for url in targets:
-            html = self._fetch(url)
-            if html is None:
+            items = self._process(url)
+            if items is None:
                 time.sleep(2)
                 continue
-            try:
-                items = self.parse(html, url)
-            except Exception as exc:
-                print(f"[parse error] {url}: {exc}")
-                self.stats["validation"] += 1
-                M.request(ok=False, error_type="validation")
-                continue
+            pending_store.extend(items)
 
-            # 基类计数（子类 parse 也可直接 M.crawl）
-            if items:
-                self.stats["crawled"] += len(items)
-                M.crawl(len(items))
-                pending_store.extend(items)
+            if not items and self.proxy:
+                # 200 但解析为空：免费代理常见劣化（劫持/插页返回垃圾 200 页）
+                self.stats["empty_pages"] += 1
+                print(f"[proxy] empty parse via proxy ({self.stats['empty_pages']}): {url}")
+                deferred.append(url)
+                if self.stats["empty_pages"] >= 2:
+                    print("[proxy] proxy degraded → release and switch to direct")
+                    M.proxy_request(ok=False, via_proxy=True)
+                    release_proxy(self.proxy, False)
+                    self.proxy = None
+                    self.session = self._build_session()
+                    for u in deferred:
+                        got = self._process(u)
+                        if got:
+                            pending_store.extend(got)
+                    deferred = []
+                continue
 
             # 批量入库（每 50 条或最后）
             if len(pending_store) >= 50:
