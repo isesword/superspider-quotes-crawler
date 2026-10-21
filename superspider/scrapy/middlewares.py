@@ -14,6 +14,7 @@ import random
 import string
 
 from scrapy import signals
+from scrapy.exceptions import DownloadTimeoutError
 from twisted.internet.error import (
     ConnectError,
     TCPTimedOutError,
@@ -76,7 +77,9 @@ class MetricsMiddleware:
 
     def process_exception(self, request, exception):
         spider = self._crawler.spider
-        if isinstance(exception, (TwistedTimeoutError, TCPTimedOutError)):
+        # Scrapy 会把底层超时包装成 DownloadTimeoutError（裸 Exception 子类，
+        # 不继承 twisted/builtin TimeoutError），必须显式识别，否则误记 server_5xx
+        if isinstance(exception, (TwistedTimeoutError, TCPTimedOutError, DownloadTimeoutError)):
             error_type, key = "timeout", "timeout"
         elif isinstance(exception, ConnectError):
             # 代理/目标连不通，按 BaseCrawler 口径计入 blocked
