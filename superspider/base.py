@@ -134,7 +134,7 @@ class BaseCrawler:
             "taskId": int(task_id),
             "projectId": int(os.environ.get("SUPERSPIDER_PROJECT_ID", "0") or 0),
             "batchId": os.environ.get("SUPERSPIDER_BATCH_ID", ""),
-            "pod": os.environ.get("HOSTNAME", ""),
+            "pod": os.environ.get("SUPERSPIDER_POD_NAME") or os.environ.get("HOSTNAME", ""),
             "status": status,
             "triggerType": os.environ.get("SUPERSPIDER_TRIGGER_TYPE", "manual"),
             "startedAt": self.started_at,
