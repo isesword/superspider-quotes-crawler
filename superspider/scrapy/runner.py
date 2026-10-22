@@ -75,12 +75,12 @@ def _report_run(ctx: CrawlContext, status: str, error_message: str = "") -> None
     if not task_id.isdigit():
         logger.warning("run report skip: no SUPERSPIDER_TASK_ID")
         return
-	payload = {
-		"taskId": int(task_id),
-		"projectId": int(os.environ.get("SUPERSPIDER_PROJECT_ID", "0") or 0),
-		"batchId": os.environ.get("SUPERSPIDER_BATCH_ID", ""),
-		"pod": os.environ.get("HOSTNAME", ""),
-		"status": status,
+    payload = {
+        "taskId": int(task_id),
+        "projectId": int(os.environ.get("SUPERSPIDER_PROJECT_ID", "0") or 0),
+        "batchId": os.environ.get("SUPERSPIDER_BATCH_ID", ""),
+        "pod": os.environ.get("HOSTNAME", ""),
+        "status": status,
         "triggerType": os.environ.get("SUPERSPIDER_TRIGGER_TYPE", "manual"),
         "startedAt": ctx.started_at,
         "finishedAt": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
