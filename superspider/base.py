@@ -130,10 +130,12 @@ class BaseCrawler:
             logger.warning("run report skip: no SUPERSPIDER_TASK_ID")
             return
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        payload = {
-            "taskId": int(task_id),
-            "projectId": int(os.environ.get("SUPERSPIDER_PROJECT_ID", "0") or 0),
-            "status": status,
+		payload = {
+			"taskId": int(task_id),
+			"projectId": int(os.environ.get("SUPERSPIDER_PROJECT_ID", "0") or 0),
+			"batchId": os.environ.get("SUPERSPIDER_BATCH_ID", ""),
+			"pod": os.environ.get("HOSTNAME", ""),
+			"status": status,
             "triggerType": os.environ.get("SUPERSPIDER_TRIGGER_TYPE", "manual"),
             "startedAt": self.started_at,
             "finishedAt": now,
