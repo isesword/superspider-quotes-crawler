@@ -165,7 +165,9 @@ class BaseCrawler:
             row = {"task_id": int(task_id or 0), "project": project, "crawled_at": now}
             row.update(item)
             rows.append(row)
-        return batch_insert("crawl_data", rows)
+        ok = batch_insert("crawl_data", rows)
+        logger.info("ch batch inserted | count={} ok={}", len(rows), ok)
+        return ok
 
     # ── 主入口 ──────────────────────────────────────────────────────
 

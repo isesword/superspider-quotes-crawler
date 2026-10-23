@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 import os
 import sys
 
@@ -45,6 +46,17 @@ def _json_sink(message) -> None:
     print(json.dumps(row, ensure_ascii=False, default=str), flush=True)
 
 
+class _InterceptHandler(logging.Handler):
+    """标准 logging → loguru 桥：Scrapy/Twisted 等库日志统一进 JSON 采集管道。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+
 _PRETTY_FORMAT = (
     "<green>{time:HH:mm:ss}</green> | "
     "<level>{level: <7}</level> | "
@@ -66,4 +78,6 @@ def setup() -> None:
         logger.add(sys.stdout, level=level, format=_PRETTY_FORMAT, colorize=None)
     else:
         logger.add(_json_sink, level=level)
+    # 标准 logging（scrapy/twisted/urllib3...）桥进 loguru：库日志统一 JSON 采集
+    logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
     # loguru 默认捕获未处理异常，保留默认行为即可

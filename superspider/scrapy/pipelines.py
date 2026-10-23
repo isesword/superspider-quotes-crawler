@@ -20,6 +20,7 @@ class ClickHousePipeline:
 
     def open_spider(self):
         self._buf: list[dict] = []
+        self._written = 0
 
     def process_item(self, item):
         self._buf.append(dict(item))
@@ -29,6 +30,7 @@ class ClickHousePipeline:
 
     def close_spider(self):
         self._flush()
+        logger.info("pipeline closed | total_written={}", self._written)
 
     def _flush(self) -> None:
         if not self._buf:
@@ -44,6 +46,7 @@ class ClickHousePipeline:
             row.update(item)
             rows.append(row)
         if batch_insert("crawl_data", rows):
+            self._written += len(rows)
             logger.info("ch batch inserted | count={}", len(rows))
         else:
             self._crawler.spider.ctx.stats["store_fail"] += len(rows)
