@@ -46,7 +46,7 @@ def _json_sink(message) -> None:
     print(json.dumps(row, ensure_ascii=False, default=str), flush=True)
 
 
-class _InterceptHandler(logging.Handler):
+class InterceptHandler(logging.Handler):
     """标准 logging → loguru 桥：Scrapy/Twisted 等库日志统一进 JSON 采集管道。"""
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -79,5 +79,5 @@ def setup() -> None:
     else:
         logger.add(_json_sink, level=level)
     # 标准 logging（scrapy/twisted/urllib3...）桥进 loguru：库日志统一 JSON 采集
-    logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
+    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
     # loguru 默认捕获未处理异常，保留默认行为即可

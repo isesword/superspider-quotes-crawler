@@ -8,10 +8,11 @@
 """
 
 import datetime
+import logging
 import os
 import time
 
-from ..log import logger
+from ..log import InterceptHandler, logger
 from ..metrics import M
 from ..storage import report_run
 
@@ -44,9 +45,6 @@ class CrawlContext:
 def _build_settings() -> dict:
     delay = float(os.environ.get("CRAWL_PAGE_DELAY", "1.5"))
     return {
-        # 关闭 scrapy 自带 stderr handler：库日志经 log.py 的 InterceptHandler
-        # 统一走 loguru JSON（stderr 原文直出会被采集端误路由）
-        "LOG_ENABLED": False,
         # 礼貌速率 + 自动节流；robots 显式不遵循（平台既有约定）
         "ROBOTSTXT_OBEY": False,
         "DOWNLOAD_DELAY": delay,
@@ -108,6 +106,10 @@ def run_scrapy(spider_cls) -> None:
 
     M.start()  # 30s 周期推送；最终值由 atexit 推（与 BaseCrawler 相同）
     process = CrawlerProcess(settings=_build_settings())
+    from twisted.logger import globalLogPublisher
+
+    # twisted 事件（引擎/中间件/重试噪音）不逐行转发——信噪比过低；
+    # 关键统计在 spider_closed 显式打印，spider_error 单独捕获（见下方信号）
     crawler = process.create_crawler(spider_cls)
 
     def on_item(item, response, spider):
@@ -123,6 +125,16 @@ def run_scrapy(spider_cls) -> None:
         M.request(ok=False, error_type="validation")
 
     def on_spider_closed(spider, reason):
+        # scrapy 引擎统计摘要（引擎噪音静默后的关键可见性）：抓取/响应/重试/异常/结束原因
+        try:
+            st = crawler.stats.get_stats()
+            logger.info(
+                "scrapy stats | responses={} items={} retries={} spider_errors={} finish={}",
+                st.get("response_received_count", 0), st.get("item_scraped_count", 0),
+                st.get("retry_count", 0), st.get("spider_exceptions_count", 0), reason,
+            )
+        except Exception:
+            pass
         stats = spider.ctx.stats
         net_fail = stats["timeout"] + stats["blocked"] + stats["server"]
         if reason in ("shutdown", "cancelled"):
@@ -140,4 +152,9 @@ def run_scrapy(spider_cls) -> None:
     crawler.signals.connect(on_spider_closed, signal=signals.spider_closed)
 
     process.crawl(crawler)
+    # spider_error：爬虫/解析异常逐条 ERROR（引擎 DEBUG 噪音已由 LOG_ENABLED 静默）
+    def _on_spider_error(failure, response, spider):
+        logger.error("spider error | {} | {}", failure.type.__name__, failure.getErrorMessage())
+
+    crawler.signals.connect(_on_spider_error, signal=signals.spider_error)
     process.start()  # 阻塞至 reactor 停止
