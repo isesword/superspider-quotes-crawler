@@ -15,11 +15,13 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(__file__))
-from crawlers.douban_top import DoubanTopSpider
-from crawlers.quotes import QuotesCrawler
 from superspider.log import logger, setup
 
+# setup 先于爬虫导入：导入期错误（语法/依赖）也走 excepthook 进 JSON 管道
 setup()
+
+from crawlers.douban_top import DoubanTopSpider
+from crawlers.quotes import QuotesCrawler
 
 try:
     from scrapy import Spider as ScrapySpider

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import threading
 
 from loguru import logger
 
@@ -32,12 +33,18 @@ def _base_cols() -> dict:
 
 
 def _json_sink(message) -> None:
-    """扁平 JSON sink：json.dumps 保证转义正确（消息含引号也安全）。"""
+    """扁平 JSON sink：json.dumps 保证转义正确（消息含引号也安全）。
+    异常记录把完整堆栈文本并入 message（多行 → \n 转义，抽屉可全文检索）。"""
     r = message.record
+    text = r["message"]
+    if r["exception"]:
+        import traceback
+
+        text += "\n" + "".join(traceback.format_exception(*r["exception"])).rstrip()
     row = {
         "ts": r["time"].strftime("%Y-%m-%d %H:%M:%S"),
         "level": r["level"].name,
-        "message": r["message"],
+        "message": text,
         **_BASE_COLS,
     }
     for k, v in r["extra"].items():
@@ -80,4 +87,20 @@ def setup() -> None:
         logger.add(_json_sink, level=level)
     # 标准 logging（scrapy/twisted/urllib3...）桥进 loguru：库日志统一 JSON 采集
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
-    # loguru 默认捕获未处理异常，保留默认行为即可
+
+    # 未捕获异常（解释器直接打 stderr 的 traceback，绕过一切日志框架）→
+    # loguru ERROR + 完整堆栈——硬崩溃也以结构化错误行进入采集管道。
+    # import 期错误能否被接住取决于 setup() 先于业务 import 执行（见 main.py）。
+    def _uncaught(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.opt(exception=(exc_type, exc_value, exc_tb)).error("Unhandled exception")
+
+    sys.excepthook = _uncaught
+    if hasattr(threading, "excepthook"):
+
+        def _thread_uncaught(args):
+            _uncaught(args.exc_type, args.exc_value, args.exc_traceback)
+
+        threading.excepthook = _thread_uncaught
